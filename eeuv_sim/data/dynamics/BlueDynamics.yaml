@@ -1,0 +1,70 @@
+### U-CAT dynamics params ###
+dynamics:
+  geometry:
+    COG: [0.0, 0.0, 0.0]   # center of gravity
+    COB: [0.0, 0.0, 0.005]    # center of buoyancy
+
+  inertial:
+    mass:  11.5 # [kg]
+    # moment of inertia based on original urdf model
+    Ixx: 0.16
+    Ixy: 0.0
+    Ixz: 0.0
+    Iyx: 0.0
+    Iyy: 0.16
+    Iyz: 0.0
+    Izx: 0.0
+    Izy: 0.0
+    Izz: 0.16
+    added_mass:
+      Xud: -5.5
+      Yvd: -12.7
+      Zwd: -14.57
+      Kpd: -0.12
+      Mqd: -0.12
+      Nrd: -0.12
+
+  drag:
+    Xu: -4.03
+    Xuu: -18.18
+    Yv: -6.22
+    Yvv: -21.66
+    Zw: -5.18
+    Zww: -36.99
+    Kp: -0.07
+    Kpp: -1.55
+    Mq: -0.07
+    Mqq: -1.55
+    Nr: -0.07
+    Nrr: -1.55
+
+# https://flex.flinders.edu.au/file/27aa0064-9de2-441c-8a17-655405d5fc2e/1/ThesisWu2018.pdf
+thrusterDynamics:
+  NumberOfThrusters: 8
+  thrustlimits: 
+    - [-20.0, 20.0]  # [N]
+    - [-20.0, 20.0]  # [N]
+    - [-20.0, 20.0]  # [N]
+    - [-20.0, 20.0]  # [N]
+    - [-20.0, 20.0]  # [N]
+    - [-20.0, 20.0]  # [N]
+    - [-20.0, 20.0]  # [N]
+    - [-20.0, 20.0]  # [N]
+  thrusterPositions:
+    - [0.156, 0.111, -0.085]
+    - [0.156, -0.111, -0.085]
+    - [-0.156, 0.111, -0.085]
+    - [-0.156, -0.111, -0.085]
+    - [0.120, 0.218, 0]
+    - [0.120, -0.218, 0]
+    - [-0.120, 0.218, 0]
+    - [-0.120, -0.218, 0]
+  thrusterDirections: #unit vector 
+    - [0.707, -0.707, 0]
+    - [0.707, 0.707, 0]
+    - [-0.707, -0.707, 0]
+    - [-0.707, 0.707, 0]
+    - [0, 0, 1]
+    - [0, 0, 1]
+    - [0, 0, 1]
+    - [0, 0, 1]

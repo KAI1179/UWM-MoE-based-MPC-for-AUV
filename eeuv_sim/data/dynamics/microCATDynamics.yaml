@@ -1,0 +1,65 @@
+### U-CAT dynamics params ###
+dynamics:
+  geometry:
+    COG: [0.0, 0.0, 0.0]   # center of gravity
+    COB: [0.0, 0.0, 0.1]    # center of buoyancy
+
+  inertial:
+    mass: 19.0  # [kg]
+    # moment of inertia based on CAD model
+    Ixx: 0.1574
+    Ixy: 0.0
+    Ixz: 0.0
+    Iyx: 0.0
+    Iyy: 0.4646
+    Iyz: 0.0
+    Izx: 0.0
+    Izy: 0.0
+    Izz: 0.51151
+    added_mass:
+      Xud: -40.0
+      Yvd: -21.0
+      Zwd: -2.0 #-149.0 (this makes it instable in pitch)
+      Kpd: -0.1269
+      Mqd: -1.2052
+      Nrd: -2.3064
+
+  drag:
+    Xu: -28.542
+    Xuu: -21.98
+    Yv: -100.7
+    Yvv: -260.0
+    Zw: -30.61
+    Zww: -161.0
+    Kp: -0.0
+    Kpp: -3.4244
+    Mq: -0.0
+    Mqq: -2.1014
+    Nr: -0.313
+    Nrr: -0.7226
+
+# Fin dyanmics
+finDynamics:
+###################################################
+  initialState: [0.0 , 3.14159, 3.14159, 0.0]
+  finMapDirection: [1.0, -1.0, -1.0, 1.0]
+  surgeMap: [1.0, -1.0, -1.0, 1.0]
+  swayMap: [-1.0, -1.0, 1.0, 1.0]
+  heaveMap: [1.0, 1.0, 1.0, 1.0]
+  rollMap: [1.0, 1.0, -1.0, -1.0]
+  pitchMap: [-1.0, 1.0, 1.0, -1.0]
+  yawMap: [-1.0, 1.0, -1.0, 1.0]
+  fin_mounting_angle: 30.0  # [deg]
+  finMomentArm: [0.1502, 0.25753, 0.2981]
+
+  wrenchDriver:
+    frequency: 2.0
+    alpha: 15.0
+    maxF: [5.0, 5.0, 5.0, 2.0, 2.0, 2.0]
+    phaseOffset: [0.0, 3.14159, 0, 3.14159]
+    psi_fins: [-30.0, 210.0, -210.0, 30.0]
+    frequency: 2.0
+  simplified:
+    k_thrust: 0.001
+    k_lateral: 0.7
+###################################################
