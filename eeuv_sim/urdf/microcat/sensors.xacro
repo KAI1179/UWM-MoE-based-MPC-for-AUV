@@ -1,0 +1,64 @@
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro">
+
+ <!-- IMU DEFITION -->
+  <xacro:macro name="robot_sensors">
+      <gazebo reference="imu_link">
+        <gravity>true</gravity>
+        <sensor name="imu_sensor" type="imu">
+          <always_on>true</always_on>
+          <update_rate>100</update_rate>
+          <imu>
+            <angular_velocity>
+              <x>
+                <noise type="gaussian">
+                  <mean>0.0</mean>
+                  <stddev>2e-4</stddev>
+                </noise>
+              </x>
+              <y>
+                <noise type="gaussian">
+                  <mean>0.0</mean>
+                  <stddev>2e-4</stddev>
+                </noise>
+              </y>
+              <z>
+                <noise type="gaussian">
+                  <mean>0.0</mean>
+                  <stddev>2e-4</stddev>
+                </noise>
+              </z>
+            </angular_velocity>
+            <linear_acceleration>
+              <x>
+                <noise type="gaussian">
+                  <mean>0.0</mean>
+                  <stddev>1.7e-2</stddev>
+                </noise>
+              </x>
+              <y>
+                <noise type="gaussian">
+                  <mean>0.0</mean>
+                  <stddev>1.7e-2</stddev>
+                </noise>
+              </y>
+              <z>
+                <noise type="gaussian">
+                  <mean>0.0</mean>
+                  <stddev>1.7e-2</stddev>
+                </noise>
+              </z>
+            </linear_acceleration>
+          </imu>
+          <plugin filename="libgazebo_ros_imu_sensor.so" name="libgazebo_ros_imu_sensor">
+                <ros>
+                    <namespace>ucat</namespace>
+                    <remapping>~/out:=imu_data</remapping>
+                </ros>
+                <initial_orientation_as_reference>true</initial_orientation_as_reference>
+                <frame_name>imu_link</frame_name>
+              </plugin>
+        </sensor>
+      </gazebo>
+  </xacro:macro>
+
+</robot>

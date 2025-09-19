@@ -1,0 +1,103 @@
+<?xml version="1.0"?>
+
+<robot name="microcat" xmlns:xacro="http://www.ros.org/wiki/xacro">
+    <xacro:property name="fin_collision_box_x" value="0.1"/>
+    <xacro:property name="fin_collision_box_y" value="0.04"/>
+    <xacro:property name="fin_collision_box_z" value="0.01"/>
+
+    <xacro:include filename="$(find uw_gazebo)/urdf/fin_snippet.xacro"/>
+    <xacro:include filename="$(find uw_gazebo)/urdf/microcat/sensors.xacro"/>
+
+
+    <xacro:property name="body_mass" value="3.0"/>
+    <xacro:property name="fin_mass" value="0.3"/>
+    <xacro:property name="body_collision_box_x" value="0.24"/>
+    <xacro:property name="body_collision_box_y" value="0.1"/>
+    <xacro:property name="body_collision_box_z" value="0.1"/>
+    <xacro:property name="body_mesh_file" value="file://$(find uw_gazebo)/urdf/meshes/microcat/micro_cat.dae"/>
+    <xacro:property name="fin_mesh_file" value="file://$(find uw_gazebo)/urdf/meshes/microcat/micro_cat_fin.dae"/>
+
+  <!-- Base Link -->
+   <link name="base_link">
+   </link>
+
+   <joint name="dummy_joint" type="fixed">
+     <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+     <parent link="base_link"/>
+     <child link="body"/>
+   </joint>
+
+   <link name="imu_link">
+   </link>
+
+   <joint name="imu_joint" type="fixed">
+     <origin xyz="0.0 0.0 0.0" rpy="3.14159 0.0 0.0"/>
+     <parent link="base_link"/>
+     <child link="imu_link"/>
+   </joint>
+
+  <link name="body">
+      <inertial>
+        <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+        <mass value="${body_mass}"/>
+        <inertia
+          ixx="${(1.0/12.0) * body_mass * (body_collision_box_y ** 2 + body_collision_box_z ** 2)}"
+          ixy="0.0"
+          ixz="0.0"
+          iyy="${(1.0/12.0) * body_mass * (body_collision_box_x ** 2 + body_collision_box_z ** 2)}"
+          iyz="0.0"
+          izz="${(1.0/12.0) * body_mass * (body_collision_box_y ** 2 + body_collision_box_x ** 2)}"/>
+      </inertial>
+
+      <visual>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="${body_mesh_file}" scale="1 1 1" />
+        </geometry>
+      </visual>
+
+      <collision>
+        <origin xyz="0 0 0" rpy="0 0 0"/>
+        <geometry>
+          <mesh filename="${body_mesh_file}" scale="1 1 1" />
+        </geometry>
+      </collision>
+  </link>
+
+  <xacro:fin name="FL" inertia_offset_x="0.03" inertia_offset_y="0.0" fin_mesh_file="${fin_mesh_file}">
+    <origin xyz="0.110 0.065 0.0" rpy="0 0 -0.52" />
+  </xacro:fin>
+
+  <xacro:fin name="BL" inertia_offset_x="0.03" inertia_offset_y="0.0" fin_mesh_file="${fin_mesh_file}">
+    <origin xyz="-0.110 0.065 0.0" rpy="0 0 0.52" />
+  </xacro:fin>
+
+  <xacro:fin name="BR" inertia_offset_x="0.03" inertia_offset_y="0.0" fin_mesh_file="${fin_mesh_file}">
+    <origin xyz="-0.110 -0.065 0.0" rpy="3.14159 0 -0.52" />
+  </xacro:fin>
+
+  <xacro:fin name="FR" inertia_offset_x="0.03" inertia_offset_y="0.0" fin_mesh_file="${fin_mesh_file}">
+    <origin xyz="0.110 -0.065 0.0" rpy="3.14159 0 0.52" />
+  </xacro:fin>
+
+
+  <gazebo reference="body">
+    <material>Gazebo/Yellow</material>
+  </gazebo>
+
+  <gazebo>
+    <plugin name="libgazebo_ros_p3d" filename="libgazebo_ros_p3d.so">
+        <ros>
+            <namespace>ucat</namespace>
+            <remapping>odom:=odom</remapping>
+            </ros>
+            <frame_name>world</frame_name>
+            <body_name>base_link</body_name>
+            <update_rate>100.0</update_rate>
+            <gaussian_noise>0.0</gaussian_noise>
+        </plugin>
+  </gazebo>
+
+  <xacro:robot_sensors/>
+
+</robot>

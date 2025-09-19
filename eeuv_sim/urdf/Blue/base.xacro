@@ -1,0 +1,63 @@
+<?xml version="1.0"?>
+<robot name="Blue" xmlns:xacro="http://www.ros.org/wiki/xacro">
+  <xacro:property name="d2r" value="0.01745329"/>
+
+  <xacro:property name="mass" value="11"/>
+  <xacro:property name="cog" value="0 0 0"/>
+  <xacro:property name="rho" value="1028"/>
+  <xacro:property name="visual_mesh_file" value="file://$(find eeuv_sim)/urdf/meshes/Blue/brov2_heavy_body.dae"/>
+
+  <link name="base_link">
+  </link>
+
+   <joint name="dummy_joint" type="fixed">
+     <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+     <parent link="base_link"/>
+     <child link="body"/>
+   </joint>
+
+<link name="body">
+      <inertial>
+        <origin xyz="0.0 0.0 0.0" rpy="0.0 0.0 0.0"/>
+        <mass value="${mass}"/>
+        <inertia
+          ixx="0.1574"
+          ixy="0.0"
+          ixz="0.0"
+          iyy="0.4646"
+          iyz="0.0"
+          izz="0.51151"/>
+      </inertial>
+
+      <visual>
+        <origin xyz="0 0 0" rpy="1.57 0 1.57"/>
+        <geometry>
+          <mesh filename="${visual_mesh_file}" scale="0.001 0.001 0.001" />
+        </geometry>
+      </visual>
+
+      <collision>
+        <origin xyz="0 0 0" rpy="1.57 0 1.57"/>
+        <geometry>
+          <mesh filename="${visual_mesh_file}" scale="0.001 0.001 0.001" />
+        </geometry>
+      </collision>
+  </link>
+
+  <gazebo reference="body">
+    <material>Gazebo/Red</material>
+  </gazebo>
+
+  <gazebo>
+    <plugin name="gazebo_ros_p3d" filename="libgazebo_ros_p3d.so">
+      <ros>
+        <namespace>ucat</namespace>
+        <remapping>odom:=odom</remapping>
+      </ros>
+      <frame_name>world</frame_name>
+      <body_name>base_link</body_name>
+      <update_rate>100.0</update_rate>
+      <gaussian_noise>0.0</gaussian_noise>
+    </plugin>
+  </gazebo>
+</robot>
