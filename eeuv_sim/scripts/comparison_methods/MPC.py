@@ -1,0 +1,289 @@
+import numpy as np
+import cvxpy as cp
+import rclpy
+import time
+from rclpy.node import Node
+from gazebo_msgs.msg import EntityState
+from geometry_msgs.msg import WrenchStamped
+from std_msgs.msg import Float32MultiArray, Bool, Header
+from eeuv_sim.srv import ResetToPose
+# from ..data_collector.thruster_wrench_exchange import ThrusterWrenchCalculator
+from scipy.interpolate import CubicSpline
+
+import h5py
+from ament_index_python.packages import get_package_share_directory
+import os
+
+class AUV6DOFDynamics:
+    def __init__(self):
+        self.mass = 11.5
+        self.I = np.diag([0.16, 0.16, 0.16])
+        self.Ma = -np.diag([5.5, 12.7, 14.57, 0.12, 0.12, 0.12])
+        self.D_lin = -np.diag([4.03, 6.22, 5.18, 0.07, 0.07, 0.07])
+        self.D_quad = -np.diag([18.18, 21.66, 36.99, 1.55, 1.55, 1.55])
+        self.g = 9.81
+        self.W = self.mass * self.g
+        self.B = self.W
+        self.COG = np.array([0.0, 0.0, 0.0])
+        self.COB = np.array([0.0, 0.0, 0.005])
+
+    def M_total(self):
+        M_rb = np.block([
+            [self.mass * np.eye(3), np.zeros((3, 3))],
+            [np.zeros((3, 3)), self.I]
+        ])
+        return M_rb + self.Ma
+
+    def D_total(self, v):
+        return self.D_lin @ v + cp.multiply(self.D_quad @ cp.abs(v), v)
+
+    def g_eta(self):
+        fg = np.array([0, 0, -(self.W - self.B), self.COB[1] * self.B, -self.COB[0] * self.B, 0])
+        return fg
+
+    def dynamics(self, v, tau):
+        # M = self.M_total()
+        # D = self.D_total(v)
+        # g = self.g_eta()
+        # v_dot = np.linalg.inv(M) @ (tau - D - g)
+        # return v_dot
+        A = np.eye(6)
+        B = np.eye(6) / self.mass
+        return A @ v + B @ tau
+
+class MPCController(Node):
+    def __init__(self, waypoints=[0.0, 0.0], dt=0.1, horizon=10, max_steps=1500):
+        super().__init__('rov_data_collector')
+        self.publisher = self.create_publisher(Float32MultiArray, '/ucat/thruster_cmd', 1)
+        self.reset_pub = self.create_publisher(Bool, '/ucat/reset', 1)
+        self.state_sub = self.create_subscription(EntityState, '/ucat/state', self.state_callback, 1)
+        self.state = None
+        self.start_time = None
+        self.waypoints = waypoints
+        # self.thru_to_wrench = ThrusterWrenchCalculator(
+        #     '/home/xukai/ros2_ws/src/eeuv_sim/data/dynamics/BlueDynamics.yaml')
+        self.reset_client = self.create_client(ResetToPose, '/reset_to_pose')
+        if not self.reset_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().error('set_entity_state service not available!')
+
+        self.publisher = self.create_publisher(WrenchStamped, '/ucat/force_thrust', 2)
+        self.trajectory = self.generate_smooth_3d_trajectory(waypoints)
+        # self.trajectory = self.generate_smooth_3d_trajectory([
+        #     [5.0, 0.0, -10.0],  # 起点靠近x最小边界
+        #     [12.0, 10.0, -20.0],  # 向右上拐弯并下降
+        #     [20.0, -10.0, -5.0],  # 向左下折返并上升
+        #     [28.0, 5.0, -18.0],  # 向右上方再次转折下降
+        #     [35.0, 0.0, -8.0]  # 终点靠近x最大边界
+        # ])
+        self.initialized = False
+
+        self.h5_open = True
+
+        self.timer_period = dt
+        self.timer = self.create_timer(self.timer_period, self.control_loop)
+        self.get_logger().info('MPC controller node initialized.')
+
+        self.dt = dt
+        self.N = horizon  # prediction horizon
+        self.Q = np.eye(3) * 1.0  # position error
+        self.R = np.eye(6) * 0.1  # control effort (Fx, Fy, Fz, Mx, My, Mz)
+        self.orientation = [1.0, 0.0, 0.0, 0.0]
+        self.dyn = AUV6DOFDynamics()
+
+        log_path = os.path.join(os.getcwd(), '/home/xukai/ros2_ws/src/eeuv_sim/scripts/comparison_methods/results/mpc_rov_log.h5')
+        self.h5file = h5py.File(log_path, 'w')
+        self.data = {
+            "time": [],
+            "position": [],
+            "orientation": [],
+            "linear_velocity": [],
+            "angular_velocity": [],
+            "thrusts": [],
+            "wrench": []
+        }
+
+        self.goal = self.trajectory[-1]
+        self.step_count = 0
+        self.max_steps = max_steps
+        self.done = False
+
+    def state_callback(self, msg):
+        self.state = msg
+        # self.last_state_time = time.time()
+
+        pos = msg.pose.position
+        twist = msg.twist
+        ori = msg.pose.orientation
+
+        self.position = np.array([pos.x, pos.y, pos.z])
+        self.velocity = np.array([
+            twist.linear.x,
+            twist.linear.y,
+            twist.linear.z,
+            twist.angular.x,
+            twist.angular.y,
+            twist.angular.z
+        ])
+        self.orientation = [ori.w, ori.x, ori.y, ori.z]
+        self.initialized = True
+
+    def pub_thrust_force(self, tau):
+
+        wrench = WrenchStamped()
+        wrench.header = Header()
+        wrench.header.stamp = self.get_clock().now().to_msg()
+        wrench.wrench.force.x = float(tau[0])
+        wrench.wrench.force.y = float(tau[1])
+        wrench.wrench.force.z = float(tau[2])
+        wrench.wrench.torque.x = float(tau[3])
+        wrench.wrench.torque.y = float(tau[4])
+        wrench.wrench.torque.z = float(tau[5])
+
+        self.publisher.publish(wrench)
+        # self.get_logger().info_once('Publishing MPC control commands.')
+
+    def control_loop(self):
+        if not self.initialized:
+            return
+        if self.done:
+            return
+
+        self.step_count += 1
+
+        # Exit if reached goal
+        if np.linalg.norm(self.position - self.goal) < 1.0:
+            self.get_logger().info('Reached goal. Exiting...')
+            self.done = True
+            self.destroy_node()
+            # rclpy.shutdown()
+            return
+
+        # Exit if exceeded max steps
+        if self.step_count > self.max_steps:
+            self.get_logger().warn('Exceeded max steps. Exiting...')
+            self.done = True
+            self.destroy_node()
+            # rclpy.shutdown()
+            return
+
+        i_curr = np.argmin(np.linalg.norm(self.trajectory - self.position, axis=1))
+        ref_traj = self.trajectory[i_curr: i_curr + self.N]
+        if len(ref_traj) < self.N:
+            ref_traj = np.pad(ref_traj, ((0, self.N - len(ref_traj)), (0, 0)), mode='edge')
+
+        # 执行 MPC 求解
+        tau = self.solve_mpc(self.position, self.velocity, ref_traj)
+        # 发布控制力
+        wrench = WrenchStamped()
+        wrench.header = Header()
+        wrench.header.stamp = self.get_clock().now().to_msg()
+        wrench.wrench.force.x = float(tau[0])
+        wrench.wrench.force.y = -float(tau[1])
+        wrench.wrench.force.z = -float(tau[2])
+        wrench.wrench.torque.x = float(tau[3])
+        wrench.wrench.torque.y = -float(tau[4])
+        wrench.wrench.torque.z = -float(tau[5])
+
+        self.publisher.publish(wrench)
+        # self.get_logger().info_once('Publishing MPC control commands.')
+
+        # Log data
+        lin = self.velocity[:3]
+        ang = self.velocity[3:]
+        self.data["time"].append(0.0)
+        self.data["position"].append(self.position.tolist())
+        self.data["orientation"].append(self.orientation)
+        self.data["linear_velocity"].append(lin.tolist())
+        self.data["angular_velocity"].append(ang.tolist())
+        self.data["thrusts"].append(tau.tolist())
+        self.data["wrench"].append(tau.tolist())
+
+    def reset_ROV(self):
+        """
+        Resets the environment: clears sim state, sets random ROV position.
+        """
+        req = ResetToPose.Request()
+
+        x, y, z = self.waypoints[0]
+
+        req.x = x
+        req.y = -y
+        req.z = -z
+        req.roll = 0.0
+        req.pitch = 0.0
+        req.yaw = 0.0
+
+        future = self.reset_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+
+        self.get_logger().info(f'Reset ROV to: x={x:.2f}, y={y:.2f}, z={z:.2f}')
+
+        self.state = None  # 清空旧状态
+        timeout = time.time() + 3.0  # 最多等待3秒
+        while self.state is None and time.time() < timeout:
+            # rclpy.spin_once(self, timeout_sec=0.1)
+            rclpy.spin_once(self)
+        if self.state is None:
+            self.get_logger().warn("No updated state received after reset!")
+
+        return True
+
+    def generate_smooth_3d_trajectory(self, waypoints, num_points=500):
+        """
+        使用三次样条在给定3D waypoint上生成平滑轨迹
+        """
+        waypoints = np.array(waypoints)
+        t = np.linspace(0, 1, len(waypoints))  # 参数化每个航点
+
+        # 分别为 x(t), y(t), z(t) 拟合三次样条
+        cs_x = CubicSpline(t, waypoints[:, 0])
+        cs_y = CubicSpline(t, waypoints[:, 1])
+        cs_z = CubicSpline(t, waypoints[:, 2])
+
+        t_smooth = np.linspace(0, 1, num_points)
+        x_smooth = cs_x(t_smooth)
+        y_smooth = cs_y(t_smooth)
+        z_smooth = cs_z(t_smooth)
+
+        trajectory = np.vstack((x_smooth, y_smooth, z_smooth)).T
+        return trajectory
+
+    def solve_mpc(self, position, velocity, ref_traj):
+        x = cp.Variable((6, self.N + 1))
+        u = cp.Variable((6, self.N))
+        cost = 0
+        constraints = [x[:, 0] == velocity]
+
+        for t in range(self.N):
+            # pos_err = position - ref_traj[t]
+            pos_err = x[:3, t] - ref_traj[t]
+
+
+            cost += cp.quad_form(pos_err, self.Q)
+            cost += cp.quad_form(u[:, t], self.R)
+            v_next = x[:, t] + self.timer_period * self.dyn.dynamics(x[:, t], u[:, t])
+            constraints += [x[:, t + 1] == v_next]
+            constraints += [cp.abs(u[:, t]) <= 20.0]
+
+        prob = cp.Problem(cp.Minimize(cost), constraints)
+        prob.solve(solver=cp.OSQP)
+        if prob.status != cp.OPTIMAL:
+            self.get_logger().warn('MPC optimization failed.')
+            return np.zeros(6)
+        return u[:, 0].value
+
+    def destroy_node(self):
+
+        if not getattr(self, "h5_open", False):
+            super().destroy_node()
+            return
+
+        for key, value in self.data.items():
+            self.h5file.create_dataset(key, data=np.array(value))
+
+        self.h5file.flush()
+        self.h5file.close()
+        self.h5_open = False
+        super().destroy_node()
+
+
