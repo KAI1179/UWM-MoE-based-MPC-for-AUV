@@ -1,0 +1,550 @@
+#!/usr/bin/env python3
+# WMPC.py
+# Model-Predictive Control (shooting/CEM) using the pretrained underwater world model
+# for path following along a smooth 3D trajectory defined by five waypoints.
+#
+# Usage (ROS 2):
+#   ros2 run eeuv_sim wmpc   (if you make an entry point), or:
+#   python3 scripts/underwaterWM/WMPC.py
+#
+# Key topics/services:
+#   Subscribes: /ucat/state           (gazebo_msgs/EntityState)
+#   Publishes:  /ucat/force_thrust    (geometry_msgs/WrenchStamped)   ← body-frame wrench
+#   Service:    /reset_to_pose        (eeuv_sim/srv/ResetToPose)      ← reset to first waypoint
+#
+# Notes:
+# - This controller plans in thruster-force space (dim = number of thrusters, usually 8),
+#   rolls out the learned world model to evaluate a cost, then publishes the equivalent wrench.
+# - The thruster→wrench mapping is loaded from the same YAML as the rest of the project.
+# - Coordinates: AUVMotion publishes /ucat/state with y,z flipped and quaternion(q) from (roll, -pitch, -yaw).
+#   We undo that here to build the internal [p(3), q(4), v(3), w(3)] = 13D state for the world model.
+
+import os
+import time
+import math
+import yaml
+import numpy as np
+import torch
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+
+from gazebo_msgs.msg import EntityState
+from geometry_msgs.msg import WrenchStamped
+from std_msgs.msg import Bool, Header, Float32MultiArray
+from eeuv_sim.srv import ResetToPose
+import h5py
+
+from ament_index_python.packages import get_package_share_directory
+from scipy.interpolate import CubicSpline
+
+# --- World model imports (local) ---
+# Expect this file to live next to worldModel.py / utils.py etc.
+from worldModel import WMConfig, ROVGRUModel
+from utils import quat_normalize_np
+
+# Thruster <-> wrench utility
+from scripts.data_collector.thruster_wrench_exchange import ThrusterWrenchCalculator
+# from ..data_collector.thruster_wrench_exchange import ThrusterWrenchCalculator
+
+def quat_to_euler(q):
+    """
+    Convert quaternion [x,y,z,w] (ROS order) to Euler roll, pitch, yaw (radians).
+    """
+    x, y, z, w = q
+    # ZYX convention
+    t0 = +2.0 * (w * x + y * z)
+    t1 = +1.0 - 2.0 * (x * x + y * y)
+    roll = math.atan2(t0, t1)
+
+    t2 = +2.0 * (w * y - z * x)
+    t2 = +1.0 if t2 > +1.0 else t2
+    t2 = -1.0 if t2 < -1.0 else t2
+    pitch = math.asin(t2)
+
+    t3 = +2.0 * (w * z + x * y)
+    t4 = +1.0 - 2.0 * (y * y + z * z)
+    yaw = math.atan2(t3, t4)
+    return roll, pitch, yaw
+
+def euler_to_quat(roll, pitch, yaw):
+    """
+    Convert Euler roll, pitch, yaw to quaternion [w,x,y,z] (model code uses [w,x,y,z]).
+    """
+    cy = math.cos(yaw * 0.5); sy = math.sin(yaw * 0.5)
+    cp = math.cos(pitch * 0.5); sp = math.sin(pitch * 0.5)
+    cr = math.cos(roll * 0.5);  sr = math.sin(roll * 0.5)
+
+    w = cr * cp * cy + sr * sp * sy
+    x = sr * cp * cy - cr * sp * sy
+    y = cr * sp * cy + sr * cp * sy
+    z = cr * cp * sy - sr * sp * cy
+    return np.array([w, x, y, z], dtype=np.float32)
+
+class WMPCController(Node):
+    def __init__(self,
+                 waypoints,
+                 wm_ckpt_path: str,
+                 yaml_dynamics: str = 'BlueDynamics.yaml',
+                 dt: float = 0.1,
+                 horizon: int = 10,
+                 max_steps: int = 2000,
+                 cem_iters: int = 4,
+                 cem_pop: int = 128,
+                 cem_elite: int = 32,
+                 action_smooth_weight: float = 1.0,
+                 log_path: str = None):
+        super().__init__('wmpc_controller')
+
+        # --- ROS I/O ---
+        # self.pub_wrench = self.create_publisher(WrenchStamped, '/ucat/force_thrust', 2)
+        self.pub_wrench = self.create_publisher(WrenchStamped, '/ucat/force_thrust', 2)
+        self.publisher_cmd = self.create_publisher(Float32MultiArray, '/ucat/thruster_cmd', 2)
+        self.pub_reset  = self.create_publisher(Bool, '/ucat/reset', 1)
+        self.sub_state  = self.create_subscription(EntityState, '/ucat/state', self._on_state, 2)
+        self.reset_cli  = self.create_client(ResetToPose, '/reset_to_pose')
+
+        # --- Planning params ---
+        self.dt = float(dt)
+        self.N  = int(horizon)
+        self.max_steps = int(max_steps)
+
+        # --- Cost weights ---
+        self.Q_pos = np.diag([4.0, 4.0, 4.0])      # position error
+        self.Q_vel = np.diag([0.2, 0.2, 0.2])      # linear vel
+        self.Q_ang = np.diag([0.1, 0.1, 0.1])      # angular vel
+        self.R     = 1e-4                           # control magnitude per thruster
+        self.Rd    = 1e-3 * action_smooth_weight    # action smoothness
+
+        # --- Waypoints & trajectory ---
+        self.waypoints = np.asarray(waypoints, dtype=np.float32).reshape(-1, 3)
+        self.trajectory = self._build_smooth_trajectory(self.waypoints, num_points=300)
+
+        # --- World model ---
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = self._load_world_model(wm_ckpt_path).to(self.device)
+        self.model.eval()
+
+        # --- Thruster mapping (YAML) ---
+        yaml_path = os.path.join(get_package_share_directory('eeuv_sim'),
+                                 'data', 'dynamics', yaml_dynamics)
+        if not os.path.exists(yaml_path):
+            raise FileNotFoundError(f'Cannot find YAML dynamics: {yaml_path}')
+        self.tw_calc = ThrusterWrenchCalculator(yaml_path)
+        self.num_thrusters = self.tw_calc.number_of_thrusters
+        self.thrust_limits = np.array(self.tw_calc.thrust_limits, dtype=np.float32)  # shape (N,2)
+        self.u_low  = self.thrust_limits[:, 0]
+        self.u_high = self.thrust_limits[:, 1]
+
+        # --- Internal state ---
+        self.state_msg = None           # latest EntityState
+        self.step = 0
+        self.done = False
+
+        self.cem_pop = cem_pop
+        self.cem_elite = cem_elite
+        self.action_smooth_weight = action_smooth_weight
+
+        self.start_time = time.time()
+        if log_path is None:
+            base = os.path.join(os.getcwd(), 'scripts', 'underwaterWM', 'results')
+            os.makedirs(base, exist_ok=True)
+            log_path = os.path.join(base, 'wmpc_log.h5')
+        self._log_path = log_path
+        self._h5file = h5py.File(self._log_path, 'w')
+        self._data = {
+            "time": [],
+            "position": [],
+            "orientation_wxyz": [],
+            "linear_velocity": [],
+            "angular_velocity": [],
+            "thrusters": [],
+            "wrench_body": [],
+            "ref_index": [],
+            "ref_point": [],
+        }
+        self.get_logger().info(f'Logging to {self._log_path}')
+
+        # Reset to the first waypoint
+        self._reset_to_first_waypoint()
+
+        # Initial action sequence mean/std for CEM (T,N_thrusters)
+        self.act_mu  = np.zeros((self.N, self.num_thrusters), dtype=np.float32)
+        self.act_std = np.tile((self.u_high - self.u_low)[None, :] * 0.25, (self.N, 1)).astype(np.float32)
+
+        # log save path
+        # log_path: str = None
+
+        self.get_logger().info('WMPC ready.')
+
+
+
+    # -----------------------------
+    # ROS callbacks / helpers
+    # -----------------------------
+    def _on_state(self, msg: EntityState):
+        self.state_msg = msg
+
+    def _reset_to_first_waypoint(self):
+        # publish /ucat/reset (optional signal to other nodes)
+        # self.pub_reset.publish(Bool(data=True))
+
+        # call /reset_to_pose service with first waypoint (flip y,z signs like MPC_5)
+        if not self.reset_cli.service_is_ready():
+            self.reset_cli.wait_for_service(timeout_sec=2.0)
+
+        req = ResetToPose.Request()
+        x, y, z = self.waypoints[0]
+        req.x, req.y, req.z = float(x), float(-y), float(-z)
+        req.roll = 0.0; req.pitch = 0.0; req.yaw = 0.0
+
+        future = self.reset_cli.call_async(req)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=5.0)
+
+        self.get_logger().info(f'Reset ROV to: x={x:.2f}, y={y:.2f}, z={z:.2f}')
+
+    # -----------------------------
+    # Trajectory (CubicSpline through 5 waypoints)
+    # -----------------------------
+    def _build_smooth_trajectory(self, waypoints, num_points=300):
+        t = np.linspace(0, 1, len(waypoints))
+        csx = CubicSpline(t, waypoints[:, 0])
+        csy = CubicSpline(t, waypoints[:, 1])
+        csz = CubicSpline(t, waypoints[:, 2])
+
+        tt = np.linspace(0, 1, num_points)
+        traj = np.stack([csx(tt), csy(tt), csz(tt)], axis=-1).astype(np.float32)
+        return traj  # (num_points, 3)
+
+    def _nearest_traj_index(self, p):
+        d = np.linalg.norm(self.trajectory - p[None, :], axis=1)
+        return int(np.argmin(d))
+
+    # -----------------------------
+    # Model utilities
+    # -----------------------------
+    def _load_world_model(self, ckpt_path: str) -> ROVGRUModel:
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f'World model checkpoint not found: {ckpt_path}')
+        ckpt = torch.load(ckpt_path, map_location='cpu')
+        cfg_dict = ckpt.get("cfg", {})
+        cfg = WMConfig(**cfg_dict) if isinstance(cfg_dict, dict) else WMConfig()
+        model = ROVGRUModel(cfg)
+        model.load_state_dict(ckpt["model_state"], strict=False)
+        return model
+
+    def _msg_to_model_state(self, msg: EntityState) -> np.ndarray:
+        # undo sign flips for position; recover internal Euler (roll, -pitch, -yaw) -> (roll, pitch, yaw)
+        px = msg.pose.position.x
+        py = -msg.pose.position.y
+        pz = -msg.pose.position.z
+        q_ros = np.array([msg.pose.orientation.x,
+                          msg.pose.orientation.y,
+                          msg.pose.orientation.z,
+                          msg.pose.orientation.w], dtype=np.float32)
+        roll_m, pitch_m, yaw_m = quat_to_euler(q_ros)  # these correspond to (roll, -pitch, -yaw) used in AUVMotion
+        roll_i, pitch_i, yaw_i = roll_m, -pitch_m, -yaw_m
+        q_model = euler_to_quat(roll_i, pitch_i, yaw_i)  # [w,x,y,z]
+        q_model = quat_normalize_np(q_model)
+
+        v = np.array([msg.twist.linear.x, msg.twist.linear.y, msg.twist.linear.z], dtype=np.float32)
+        w = np.array([msg.twist.angular.x, msg.twist.angular.y, msg.twist.angular.z], dtype=np.float32)
+
+        x = np.concatenate([np.array([px, py, pz], dtype=np.float32),
+                            q_model.astype(np.float32),
+                            v, w], axis=0)
+        assert x.shape[0] == 13
+        return x
+
+    # -----------------------------
+    # Cost & rollout
+    # -----------------------------
+    def _stage_cost(self, x: torch.Tensor, p_ref: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B,13)  [p(3), q(4), v(3), w(3)]
+        p_ref: (B,3)
+        u: (B,Nu)
+        returns: (B,) cost
+        """
+        pos = x[:, 0:3]
+        vel = x[:, 7:10]
+        ang = x[:, 10:13]
+
+        # position error
+        e = pos - p_ref
+        c_pos = torch.sum(e @ torch.as_tensor(self.Q_pos, dtype=x.dtype, device=x.device) * e, dim=1)
+        c_vel = torch.sum(vel @ torch.as_tensor(self.Q_vel, dtype=x.dtype, device=x.device) * vel, dim=1)
+        c_ang = torch.sum(ang @ torch.as_tensor(self.Q_ang, dtype=x.dtype, device=x.device) * ang, dim=1)
+        c_u   = self.R * torch.sum(u * u, dim=1)
+        return c_pos + c_vel + c_ang + c_u
+
+    # @torch.no_grad()
+    @torch.inference_mode()
+    def _rollout_cost(self, x0_np: np.ndarray, U_seq_np: np.ndarray, ref_idx: int) -> float:
+        """
+        Evaluate cost of one candidate action sequence.
+        x0_np: (13,)
+        U_seq_np: (N, Nu)  thruster forces
+        ref_idx: index on ref trajectory to track for first step; later steps advance along it
+        """
+        device = self.device
+        B = 1
+        T = U_seq_np.shape[0]
+        # Build tensors
+        x_t = torch.as_tensor(x0_np, dtype=torch.float32, device=device).unsqueeze(0)  # (1,13)
+        # Rollout using the model.compose_next and a simple Euler-like step through learned delta
+        # We call model in step-by-step fashion because worldModel.rollout expects (B,T,*) sequences.
+        h = None
+        cost = torch.zeros((1,), dtype=torch.float32, device=device)
+        last_u = None
+
+        for t in range(T):
+            u_t = torch.as_tensor(U_seq_np[t], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(1)  # (1,1,Nu)
+            x_in = x_t.unsqueeze(1)  # (1,1,13)
+
+            pred = self.model(x_in, u_t, h)  # dict with keys: mu (B,1,12), logvar, h
+            mu = pred["mu"][:, 0]            # (1,12)
+            h = pred["h"]
+
+            # compose next
+            # x_t: (1,13) ; mu encodes delta p, delta v, delta w, delta-theta
+            x_t = self.model.compose_next(x_t, mu)  # (1,13)
+
+            # Reference advances along the path
+            ref_idx_t = min(ref_idx + t, self.trajectory.shape[0] - 1)
+            pref = torch.as_tensor(self.trajectory[ref_idx_t], dtype=torch.float32, device=device).unsqueeze(0)  # (1,3)
+
+            # cost
+            u_flat = u_t[:, 0, :]  # (1,Nu)
+            c = self._stage_cost(x_t, pref, u_flat)
+
+            # smoothness
+            if last_u is not None:
+                c = c + self.Rd * torch.sum((u_flat - last_u) ** 2, dim=1)
+            last_u = u_flat
+
+            cost = cost + c
+
+        return float(cost.item())
+
+    @torch.inference_mode()
+    def _rollout_cost_batch(self, x0_np: np.ndarray, U_seq_np: np.ndarray, ref_idx: int) -> np.ndarray:
+        """
+        批量评估多个候选序列的代价。
+        x0_np:  (13,)                       初始状态（同原来）
+        U_seq_np: (P, T, Nu)               P个候选，每个长度T、维度Nu的动作序列
+        ref_idx: int                       参考轨迹起点索引（对所有候选共用）
+        return: (P,) 的 numpy 数组，表示每个候选的总代价
+        """
+        device = self.device
+        U = torch.as_tensor(U_seq_np, dtype=torch.float32, device=device)  # (P, T, Nu)
+        P, T, Nu = U.shape
+
+        # 初始状态复制到 batch
+        x_t = torch.as_tensor(x0_np, dtype=torch.float32, device=device).unsqueeze(0).expand(P, -1)  # (P, 13)
+        h = None  # 让模型根据 batch 维自己初始化隐状态（若模型需要，也可以自己构造 zeros）
+
+        # 预取参考轨迹(随时间前进)，shape: (T, 3) → (P, 3) 每步广播
+        ref_slice = self.trajectory[ref_idx:ref_idx + T]
+        if ref_slice.shape[0] < T:
+            # 防止越界：用最后一个点填充
+            last = self.trajectory[-1]
+            pad = np.repeat(last[None, :], T - ref_slice.shape[0], axis=0)
+            ref_slice = np.concatenate([ref_slice, pad], axis=0)
+        pref_T = torch.as_tensor(ref_slice, dtype=torch.float32, device=device)  # (T, 3)
+
+        cost = torch.zeros((P,), dtype=torch.float32, device=device)
+        last_u = None
+
+        for t in range(T):
+            u_t = U[:, t, :].unsqueeze(1)  # (P, 1, Nu)
+            x_in = x_t.unsqueeze(1)  # (P, 1, 13)
+
+            # 世界模型一步前向（批量）
+            pred = self.model(x_in, u_t, h)  # 期望返回 dict: {"mu": (P,1,12), "logvar":..., "h": ...}
+            mu = pred["mu"][:, 0]  # (P, 12)
+            h = pred["h"]
+
+            # 组合下一个状态（保持与你的 worldModel.compose_next 一致）
+            x_t = self.model.compose_next(x_t, mu)  # (P, 13)
+
+            # 代价
+            p_ref = pref_T[t].unsqueeze(0).expand(P, -1)  # (P, 3)
+            u_flat = u_t[:, 0, :]  # (P, Nu)
+            c = self._stage_cost(x_t, p_ref, u_flat)
+
+            # 平滑项
+            if last_u is not None:
+                c = c + self.Rd * torch.sum((u_flat - last_u) ** 2, dim=1)
+            last_u = u_flat
+
+            cost = cost + c
+
+        return cost.detach().cpu().numpy()  # (P,)
+
+    # -----------------------------
+    # CEM planner
+    # -----------------------------
+    def _plan(self, x0: np.ndarray) -> np.ndarray:
+        Nu = self.num_thrusters
+        T  = self.N
+
+        mu  = self.act_mu.copy()    # (T,Nu)
+        std = self.act_std.copy()   # (T,Nu)
+
+        ref_start = self._nearest_traj_index(x0[0:3])
+
+        for it in range(4):  # fixed small number of iterations for stability
+            # sample
+            samples = np.random.randn(self.N, self.num_thrusters, self.cem_pop).transpose(2,0,1)  # (P,T,Nu)
+            U = mu[None, :, :] + std[None, :, :] * samples                                  # (P,T,Nu)
+            # clip to limits
+            U = np.clip(U, self.u_low[None, None, :], self.u_high[None, None, :])
+
+
+
+            # tmp_now = time.time()
+            # evaluate
+            # costs = np.empty((self.cem_pop,), dtype=np.float32)
+            # for i in range(self.cem_pop):
+            #     costs[i] = self._rollout_cost(x0, U[i], ref_start)
+
+            costs = self._rollout_cost_batch(x0, U, ref_start)
+
+            # cost_time = time.time() - tmp_now
+            # print(cost_time, "\n")
+
+            elite_idx = np.argsort(costs)[:self.cem_elite]
+            elites = U[elite_idx]  # (E,T,Nu)
+
+            # update
+            mu  = 0.8 * mu  + 0.2 * elites.mean(axis=0)
+            std = 0.8 * std + 0.2 * elites.std(axis=0)
+
+        # save distribution for next time (warm start)
+        self.act_mu, self.act_std = mu, np.maximum(std, 1e-3)
+
+        # return mu[0]  # first action of planned sequence (Nu,)
+
+        return mu[0], ref_start
+
+    # -----------------------------
+    # Main step
+    # -----------------------------
+    def step_once(self):
+        if self.state_msg is None:
+            return
+
+        # build model state x
+        x = self._msg_to_model_state(self.state_msg)
+
+        # plan in thruster space
+        # u_thr = self._plan(x)  # (Nu,)
+        u_thr, ref_idx = self._plan(x)
+        u_thr = np.clip(u_thr, self.u_low, self.u_high)
+
+
+        msg = Float32MultiArray(data=u_thr.tolist())
+        self.publisher_cmd.publish(msg)
+
+
+        # # convert to body-frame wrench via YAML config
+        wrench_body = self.tw_calc.compute_wrench(u_thr)  # (6,) [Fx,Fy,Fz,Tx,Ty,Tz]
+
+        # # publish WrenchStamped (body frame)
+        # msg = WrenchStamped()
+        # msg.header = Header()
+        # msg.header.stamp = self.get_clock().now().to_msg()
+        # msg.wrench.force.x  = float(wrench_body[0])
+        # msg.wrench.force.y  = float(wrench_body[1])
+        # msg.wrench.force.z  = float(wrench_body[2])
+        # msg.wrench.torque.x = float(wrench_body[3])
+        # msg.wrench.torque.y = float(wrench_body[4])
+        # msg.wrench.torque.z = float(wrench_body[5])
+        # self.pub_wrench.publish(msg)
+
+        now = time.time() - self.start_time
+
+        print(self.step, "\n")
+        print(u_thr, "\n")
+        print(now, "\n")
+
+        pos = self.state_msg.pose.position
+        ori = self.state_msg.pose.orientation
+        tw = self.state_msg.twist
+        lin = [tw.linear.x, tw.linear.y, tw.linear.z]
+        ang = [tw.angular.x, tw.angular.y, tw.angular.z]
+
+        self._data["time"].append(now)
+        self._data["position"].append([pos.x, pos.y, pos.z])  # 直接使用话题中的实际坐标
+        self._data["orientation_wxyz"].append([ori.w, ori.x, ori.y, ori.z])  # 与 MPC_5.py 保持的 wxyz 顺序
+        self._data["linear_velocity"].append(lin)
+        self._data["angular_velocity"].append(ang)
+        self._data["thrusters"].append(u_thr.tolist())
+        self._data["wrench_body"].append(wrench_body.tolist())
+        self._data["ref_index"].append(int(ref_idx))
+        self._data["ref_point"].append(self.trajectory[min(ref_idx, self.trajectory.shape[0] - 1)].tolist())
+
+        self.step += 1
+        if self.step >= self.max_steps:
+            self.done = True
+
+    def destroy_node(self):
+        try:
+            for k, v in self._data.items():
+                self._h5file.create_dataset(k, data=np.array(v))
+            self._h5file.flush()
+            self._h5file.close()
+        except Exception as e:
+            try:
+                self.get_logger().error(f'Failed to write HDF5: {e}')
+            except Exception:
+                pass
+        super().destroy_node()
+
+def main():
+    rclpy.init()
+
+    # ---- Define five 3D waypoints (match MPC_5 style: x, y, z in meters) ----
+    # You can modify these points or pass via parameters if you integrate as a ROS node.
+    waypoints = [
+        [2.0, -3.0, -5.0],
+        [6.0, 5.0, -10.0],
+        [10.0, -5.0, -2.0],
+        [14.0, 2.0, -9.0],
+        [18.0, 0.0, -4.0]
+    ]
+
+    # ---- Paths: pretrained world model checkpoint & dynamics YAML ----
+    # Put your actual checkpoint path here (produced by underwaterWM/run.py).
+    # The checkpoint must include the model_state and cfg in a torch.save dict.
+    wm_ckpt_path = os.environ.get('WM_CKPT', './checkpoints/20250814_2031/model_epoch200.pt')
+    yaml_dynamics = os.environ.get('YAML_DYN', '/home/xukai/ros2_ws/src/eeuv_sim/data/dynamics/BlueDynamics.yaml')
+
+    node = WMPCController(
+        waypoints=waypoints,
+        wm_ckpt_path=wm_ckpt_path,
+        yaml_dynamics=yaml_dynamics,
+        dt=0.1,
+        horizon=15,
+        max_steps=5000,
+        cem_iters=4,
+        cem_pop=256,
+        cem_elite=32,
+        log_path='./logs/wmpc_0815_1123.h5',
+    )
+
+    executor = SingleThreadedExecutor()
+    executor.add_node(node)
+
+    try:
+        while rclpy.ok() and not node.done:
+            executor.spin_once(timeout_sec=0.05)
+            node.step_once()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()
